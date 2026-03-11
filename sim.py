@@ -1,21 +1,20 @@
-import logging
-import time
-
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 
 # ===================== PARAMETERS =====================
 
 # -------- Beam --------
 PROTON_KE_MEV = 7750.0        # kinetic energy in MeV (7.75 GeV beam)
-PROTON_FLUX = 500000           # particles / (400ms spill) — rough estimate
+PARTICLES_PER_SPILL = 500000   # total protons per spill — rough estimate
+SPILL_DURATION = 0.4           # seconds
+PROTON_RATE = PARTICLES_PER_SPILL / SPILL_DURATION  # particles/s during spill
 BEAM_AREA = 2.0106192983e-10   # m^2, π(8µm)^2
 
 # -------- Geometry --------
 NUM_PHYSICAL_LAYERS = 4
 PAIRS_PER_LAYER = 100          # water/bismuth pairs per physical layer
-WATER_THICKNESS = 1e-5         # m per water sub-layer (10 µm)
-BISMUTH_THICKNESS = 1e-5       # m per bismuth sub-layer (10 µm)
+WATER_THICKNESS = 1e-4         # m per water sub-layer (10 µm)
+BISMUTH_THICKNESS = 1e-4       # m per bismuth sub-layer (10 µm)
 
 # -------- Boundary Conditions --------
 H_COOLING = 1e3                # convective heat transfer coeff (W/m^2/K)
@@ -46,8 +45,6 @@ A_BISMUTH = 208.98
 
 THERMAL_EXPANSION_WATER = 2.07e-4  # 1/K
 N_A = 6.022e23
-
-logger = logging.getLogger(__name__)
 
 # ===================== GEOMETRY =====================
 
@@ -218,31 +215,22 @@ def thomas_solve(a, b, c, d):
 # ===================== SIMULATION =====================
 
 def compute_stable_dt(rho, cp, k):
-    """Compute max stable dt for explicit method (informational), use for CN step sizing."""
-    alpha_max = np.max(k / (rho * cp))
-    dt_explicit_max = 0.5 * DX**2 / alpha_max
-    # CN is unconditionally stable, but use a reasonable dt for accuracy
-    dt = min(0.01, 10 * dt_explicit_max)  # allow larger steps since implicit
-    return dt
+    # CN is unconditionally stable — use a physically reasonable dt
+    # Limit by how fast temperatures change, not diffusion stability
+    return 0.01  # 10ms steps
 
 
 def run_simulation():
-    sim_start = time.perf_counter()
-
-    logger.info("building spatial grid")
     z, material_map = build_spatial_grid()
     N = len(z)
-    logger.info("grid ready: %s cells, total length %.2f mm", N, z[-1] * 1000)
+    print(f"Grid: {N} cells, total length: {z[-1]*1000:.2f} mm")
 
-    logger.info("precomputing thermal properties")
     rho, cp, k = get_thermal_props(material_map)
     dt = compute_stable_dt(rho, cp, k)
-    logger.info("time step set to %.6f s", dt)
+    print(f"Using dt = {dt:.6f} s")
 
     T = np.full(N, T_ENV)  # start at ambient
     times = np.arange(0, SIMULATION_TIME, dt)
-    num_steps = len(times)
-    logger.info("running %s simulation steps over %.2f s", num_steps, SIMULATION_TIME)
 
     avg_temps = []
     exit_energies = []
@@ -250,26 +238,17 @@ def run_simulation():
 
     # precompute layer boundaries
     cells_per_layer = N // NUM_PHYSICAL_LAYERS
-    progress_interval = max(1, num_steps // 10)
-    transport_total = 0.0
-    thermal_total = 0.0
 
-    for step_idx, t in enumerate(times, start=1):
-        transport_start = time.perf_counter()
+    for t in times:
         deposition_MeV, KE_exit = transport_protons(PROTON_KE_MEV, material_map, T)
-        transport_total += time.perf_counter() - transport_start
 
         # Convert MeV deposition to volumetric heat source (W/m^3)
+        # Q = (energy/particle/cell) * (particles/s) / (cell_volume)
+        # cell_volume = DX * BEAM_AREA
         deposition_J = deposition_MeV * 1e6 * E_CHARGE  # MeV -> J
-        Q = deposition_J * PROTON_FLUX / (BEAM_AREA)  # J/m (per unit area already in beam)
-        # Actually: Q should be W/m^3 = (energy per particle per cell) * (particles/s) / (cell volume)
-        # cell volume in 1D = DX * BEAM_AREA
-        Q = deposition_J * PROTON_FLUX / (DX * BEAM_AREA) * BEAM_AREA  # simplifies to deposition_J * FLUX / DX
-        Q = deposition_J * PROTON_FLUX / DX
+        Q = deposition_J * PROTON_RATE / (DX * BEAM_AREA)  # W/m^3
 
-        thermal_start = time.perf_counter()
         T = thermal_step_implicit(T, Q, rho, cp, k, dt)
-        thermal_total += time.perf_counter() - thermal_start
 
         avg_temps.append(np.mean(T))
         exit_energies.append(KE_exit)
@@ -282,36 +261,10 @@ def run_simulation():
             layer_temps.append(np.mean(T[start:end]))
         layer_avg_temps.append(layer_temps)
 
-        if step_idx == 1 or step_idx % progress_interval == 0 or step_idx == num_steps:
-            elapsed = time.perf_counter() - sim_start
-            logger.info(
-                "step %s/%s t=%.4f s elapsed=%.2f s transport=%.2f s thermal=%.2f s avg_temp=%.3f K exit_ke=%.2f MeV",
-                step_idx,
-                num_steps,
-                t,
-                elapsed,
-                transport_total,
-                thermal_total,
-                avg_temps[-1],
-                KE_exit,
-            )
-
-    logger.info(
-        "simulation complete in %.2f s; transport %.2f s, thermal %.2f s",
-        time.perf_counter() - sim_start,
-        transport_total,
-        thermal_total,
-    )
-
     return times, np.array(avg_temps), np.array(exit_energies), np.array(layer_avg_temps), z, T
 
 
 # ===================== RUN =====================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
 
 times, avg_temp, exit_energy, layer_temps, z, T_final = run_simulation()
 
