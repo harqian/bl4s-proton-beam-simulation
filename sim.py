@@ -17,12 +17,12 @@ WATER_THICKNESS = 1e-4         # m per water sub-layer (10 µm)
 BISMUTH_THICKNESS = 1e-4       # m per bismuth sub-layer (10 µm)
 
 # -------- Boundary Conditions --------
-H_COOLING = 1e3                # convective heat transfer coeff (W/m^2/K)
+H_COOLING = 1e5                # convective heat transfer coeff (W/m^2/K)
 T_ENV = 293.0                  # K
 
 # -------- Numerics --------
-DX = 1e-5                      # spatial step (m) — match sub-layer thickness
-SIMULATION_TIME = 3.0          # seconds
+DX = 1e-4                      # spatial step (m) — match sub-layer thickness
+SIMULATION_TIME = 10.0          # seconds
 
 # ===================== CONSTANTS =====================
 
@@ -45,6 +45,14 @@ A_BISMUTH = 208.98
 
 THERMAL_EXPANSION_WATER = 2.07e-4  # 1/K
 N_A = 6.022e23
+
+TRIALS = [
+    ("Trial 1: 80 g Bi + 200 g H2O", 80.0, 200.0),
+    ("Trial 2: 40 g Bi + 200 g H2O", 40.0, 200.0),
+    ("Trial 3: 20 g Bi + 200 g H2O", 20.0, 200.0),
+    ("Trial 4: 10 g Bi + 200 g H2O", 10.0, 200.0),
+    ("Trial 5: pure Bi", 2000.0, 0.0),
+]
 
 # ===================== GEOMETRY =====================
 
@@ -72,6 +80,26 @@ def build_spatial_grid():
             current_z += DX
 
     return np.array(z_positions), np.array(material_map)
+
+
+def build_trial_material_map(bismuth_g, water_ml):
+    total_cells = len(build_layers()) * max(1, int(round(WATER_THICKNESS / DX)))
+    if water_ml <= 0:
+        return np.full(total_cells, "bismuth")
+    if bismuth_g <= 0:
+        return np.full(total_cells, "water")
+
+    bismuth_volume_ml = bismuth_g / (DENSITY_BISMUTH * 1e-3)
+    bismuth_fraction = bismuth_volume_ml / (bismuth_volume_ml + water_ml)
+    bismuth_cells = int(round(total_cells * bismuth_fraction))
+
+    material_map = np.full(total_cells, "water", dtype="<U7")
+    if bismuth_cells == 0:
+        return material_map
+
+    indices = np.linspace(0, total_cells - 1, bismuth_cells, dtype=int)
+    material_map[indices] = "bismuth"
+    return material_map
 
 
 # ===================== BETHE-BLOCH (all in MeV) =====================
@@ -143,6 +171,28 @@ def transport_protons(KE0_MeV, material_map, T_profile):
     return deposition_MeV, KE
 
 
+def compute_energy_profile(KE0_MeV, material_map, T_profile):
+    KE = KE0_MeV
+    energy_profile = np.empty(len(material_map))
+
+    for i, mat in enumerate(material_map):
+        if mat == "water":
+            density = DENSITY_WATER * (1 - THERMAL_EXPANSION_WATER * (T_profile[i] - T_ENV))
+        else:
+            density = DENSITY_BISMUTH
+
+        S = stopping_power(KE, mat, density)
+        dE = min(S * DX, KE)
+        KE -= dE
+        energy_profile[i] = KE
+
+        if KE <= 0:
+            energy_profile[i:] = 0.0
+            break
+
+    return energy_profile
+
+
 # ===================== THERMAL SOLVER (implicit) =====================
 
 def get_thermal_props(material_map):
@@ -179,17 +229,21 @@ def thermal_step_implicit(T, Q, rho, cp, k, dt):
         d[i] = (r[i] * T[i-1] + (1 - 2*r[i]) * T[i] + r[i] * T[i+1]
                 + dt * Q[i] / (rho[i] * cp[i]))
 
-    # Left boundary: convective cooling
-    h_coeff_L = H_COOLING * dt / (rho[0] * cp[0] * DX)
-    b[0] = 1 + h_coeff_L
-    c_diag[0] = 0
-    d[0] = T[0] + h_coeff_L * T_ENV + dt * Q[0] / (rho[0] * cp[0])
+    # boundary rows keep conductive coupling to the adjacent cell while
+    # adding a robin-type cooling term to the environment
+    h_coeff_L = H_COOLING * dt / (2 * rho[0] * cp[0] * DX)
+    a[0] = 0.0
+    b[0] = 1 + r[0] + h_coeff_L
+    c_diag[0] = -r[0]
+    d[0] = ((1 - r[0] - h_coeff_L) * T[0] + r[0] * T[1]
+            + 2 * h_coeff_L * T_ENV + dt * Q[0] / (rho[0] * cp[0]))
 
-    # Right boundary: convective cooling
-    h_coeff_R = H_COOLING * dt / (rho[-1] * cp[-1] * DX)
-    a[-1] = 0
-    b[-1] = 1 + h_coeff_R
-    d[-1] = T[-1] + h_coeff_R * T_ENV + dt * Q[-1] / (rho[-1] * cp[-1])
+    h_coeff_R = H_COOLING * dt / (2 * rho[-1] * cp[-1] * DX)
+    a[-1] = -r[-1]
+    b[-1] = 1 + r[-1] + h_coeff_R
+    c_diag[-1] = 0.0
+    d[-1] = (r[-1] * T[-2] + (1 - r[-1] - h_coeff_R) * T[-1]
+             + 2 * h_coeff_R * T_ENV + dt * Q[-1] / (rho[-1] * cp[-1]))
 
     # Thomas algorithm (tridiagonal solve)
     T_new = thomas_solve(a, b, c_diag, d)
@@ -220,15 +274,11 @@ def compute_stable_dt(rho, cp, k):
     return 0.01  # 10ms steps
 
 
-def run_simulation():
-    z, material_map = build_spatial_grid()
-    N = len(z)
-    print(f"Grid: {N} cells, total length: {z[-1]*1000:.2f} mm")
-
+def simulate_material_map(material_map):
+    N = len(material_map)
+    z = np.arange(N) * DX
     rho, cp, k = get_thermal_props(material_map)
     dt = compute_stable_dt(rho, cp, k)
-    print(f"Using dt = {dt:.6f} s")
-
     T = np.full(N, T_ENV)  # start at ambient
     times = np.arange(0, SIMULATION_TIME, dt)
 
@@ -262,6 +312,56 @@ def run_simulation():
         layer_avg_temps.append(layer_temps)
 
     return times, np.array(avg_temps), np.array(exit_energies), np.array(layer_avg_temps), z, T
+
+
+def run_simulation():
+    z, material_map = build_spatial_grid()
+    print(f"Grid: {len(z)} cells, total length: {z[-1]*1000:.2f} mm")
+
+    rho, cp, k = get_thermal_props(material_map)
+    dt = compute_stable_dt(rho, cp, k)
+    print(f"Using dt = {dt:.6f} s")
+
+    return simulate_material_map(material_map)
+
+
+def plot_trial_energy_profiles():
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for label, bismuth_g, water_ml in TRIALS:
+        material_map = build_trial_material_map(bismuth_g, water_ml)
+        z = np.arange(len(material_map)) * DX
+        T_profile = np.full(len(material_map), T_ENV)
+        energy_profile = compute_energy_profile(PROTON_KE_MEV, material_map, T_profile)
+        ax.plot(z * 1000, energy_profile, linewidth=2, label=label)
+
+    ax.set_xlabel("Depth Through Shield (mm)")
+    ax.set_ylabel("Proton Energy Remaining (MeV)")
+    ax.set_title("Proton Energy Remaining vs Depth for Shield Trials")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig("energy_remaining_by_trial.png", dpi=150)
+    return fig
+
+
+def plot_trial_temperature_profiles():
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for label, bismuth_g, water_ml in TRIALS:
+        material_map = build_trial_material_map(bismuth_g, water_ml)
+        _, _, _, _, z, T_final = simulate_material_map(material_map)
+        ax.plot(z * 1000, T_final - T_ENV, linewidth=2, label=label)
+
+    ax.set_xlabel("Depth Through Shield (mm)")
+    ax.set_ylabel("Final Temperature Rise (K, log scale)")
+    ax.set_title("Final Temperature Rise vs Depth for Shield Trials")
+    ax.set_yscale("log")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig("temperature_rise_by_trial.png", dpi=150)
+    return fig
 
 
 # ===================== RUN =====================
@@ -300,6 +400,12 @@ for i in range(1, NUM_PHYSICAL_LAYERS):
 plt.tight_layout()
 plt.savefig("simulation_results.png", dpi=150)
 plt.show()
+
+trial_fig = plot_trial_energy_profiles()
+trial_fig.show()
+
+trial_temp_fig = plot_trial_temperature_profiles()
+trial_temp_fig.show()
 
 print(f"\nFinal avg temp: {avg_temp[-1]:.2f} K (ΔT = {avg_temp[-1]-293:.4f} K)")
 print(f"Final exit energy: {exit_energy[-1]:.2f} MeV (of {PROTON_KE_MEV:.0f} MeV input)")
