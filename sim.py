@@ -207,6 +207,25 @@ def get_thermal_props(material_map):
     return rho, cp, k
 
 
+def compute_cell_masses(rho):
+    return rho * DX * BEAM_AREA
+
+
+def compute_trial_total_mass_kg(bismuth_g, water_ml):
+    water_mass_g = water_ml
+    return (bismuth_g + water_mass_g) / 1000.0
+
+
+def compute_mass_normalized_temperature_rise(T_profile, cell_masses, total_mass_kg):
+    delta_T = T_profile - T_ENV
+    mass_weighted_delta_T = np.average(delta_T, weights=cell_masses)
+    return mass_weighted_delta_T / total_mass_kg
+
+
+def compute_total_deposited_energy_J(total_deposition_MeV):
+    return total_deposition_MeV * 1e6 * E_CHARGE
+
+
 def thermal_step_implicit(T, Q, rho, cp, k, dt):
     """
     Crank-Nicolson (tridiagonal solve) for 1D heat equation.
@@ -278,6 +297,7 @@ def simulate_material_map(material_map):
     N = len(material_map)
     z = np.arange(N) * DX
     rho, cp, k = get_thermal_props(material_map)
+    cell_masses = compute_cell_masses(rho)
     dt = compute_stable_dt(rho, cp, k)
     T = np.full(N, T_ENV)  # start at ambient
     times = np.arange(0, SIMULATION_TIME, dt)
@@ -285,12 +305,14 @@ def simulate_material_map(material_map):
     avg_temps = []
     exit_energies = []
     layer_avg_temps = []  # per-layer tracking
+    total_deposited_energy_MeV = 0.0
 
     # precompute layer boundaries
     cells_per_layer = N // NUM_PHYSICAL_LAYERS
 
     for t in times:
         deposition_MeV, KE_exit = transport_protons(PROTON_KE_MEV, material_map, T)
+        total_deposited_energy_MeV += np.sum(deposition_MeV) * PROTON_RATE * dt
 
         # Convert MeV deposition to volumetric heat source (W/m^3)
         # Q = (energy/particle/cell) * (particles/s) / (cell_volume)
@@ -311,7 +333,17 @@ def simulate_material_map(material_map):
             layer_temps.append(np.mean(T[start:end]))
         layer_avg_temps.append(layer_temps)
 
-    return times, np.array(avg_temps), np.array(exit_energies), np.array(layer_avg_temps), z, T
+    total_deposited_energy_J = compute_total_deposited_energy_J(total_deposited_energy_MeV)
+    return (
+        times,
+        np.array(avg_temps),
+        np.array(exit_energies),
+        np.array(layer_avg_temps),
+        z,
+        T,
+        total_deposited_energy_J,
+        cell_masses,
+    )
 
 
 def run_simulation():
@@ -325,7 +357,33 @@ def run_simulation():
     return simulate_material_map(material_map)
 
 
-def plot_trial_energy_profiles():
+def summarize_trial_metrics(label, bismuth_g, water_ml):
+    material_map = build_trial_material_map(bismuth_g, water_ml)
+    total_mass_kg = compute_trial_total_mass_kg(bismuth_g, water_ml)
+    (
+        _times,
+        _avg_temps,
+        exit_energies,
+        _layer_temps,
+        _z,
+        T_final,
+        total_deposited_energy_J,
+        cell_masses,
+    ) = simulate_material_map(material_map)
+    mass_normalized_delta_T = compute_mass_normalized_temperature_rise(
+        T_final, cell_masses, total_mass_kg
+    )
+    mass_normalized_energy = total_deposited_energy_J / total_mass_kg
+    return {
+        "label": label,
+        "total_mass_kg": total_mass_kg,
+        "mass_normalized_delta_T": mass_normalized_delta_T,
+        "mass_normalized_deposited_energy": mass_normalized_energy,
+        "final_exit_energy_MeV": exit_energies[-1],
+    }
+
+
+def plot_trial_energy_remaining_profiles():
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for label, bismuth_g, water_ml in TRIALS:
@@ -345,17 +403,19 @@ def plot_trial_energy_profiles():
     return fig
 
 
-def plot_trial_temperature_profiles():
+def plot_trial_energy_profiles():
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for label, bismuth_g, water_ml in TRIALS:
         material_map = build_trial_material_map(bismuth_g, water_ml)
-        _, _, _, _, z, T_final = simulate_material_map(material_map)
-        ax.plot(z * 1000, T_final - T_ENV, linewidth=2, label=label)
+        total_mass_kg = compute_trial_total_mass_kg(bismuth_g, water_ml)
+        _, _, _, _, z, T_final, _, _ = simulate_material_map(material_map)
+        heat_const = 0.123*bismuth_g/(bismuth_g+water_ml)+4.184*water_ml/(bismuth_g+water_ml)
+        ax.plot(z * 1000, (T_final - T_ENV) * heat_const, linewidth=2, label=label)
 
     ax.set_xlabel("Depth Through Shield (mm)")
-    ax.set_ylabel("Final Temperature Rise (K, log scale)")
-    ax.set_title("Final Temperature Rise vs Depth for Shield Trials")
+    ax.set_ylabel("Energy (J), log scale)")
+    ax.set_title("Energy (J) vs Depth (mm) for Shield Trials")
     ax.set_yscale("log")
     ax.legend()
     ax.grid(alpha=0.3)
@@ -366,7 +426,7 @@ def plot_trial_temperature_profiles():
 
 # ===================== RUN =====================
 
-times, avg_temp, exit_energy, layer_temps, z, T_final = run_simulation()
+times, avg_temp, exit_energy, layer_temps, z, T_final, total_deposited_energy_J, cell_masses = run_simulation()
 
 # --- Plots ---
 fig, axes = plt.subplots(2, 2, figsize=(12, 9))
@@ -401,11 +461,18 @@ plt.tight_layout()
 plt.savefig("simulation_results.png", dpi=150)
 plt.show()
 
-trial_fig = plot_trial_energy_profiles()
+trial_fig = plot_trial_energy_remaining_profiles()
 trial_fig.show()
 
-trial_temp_fig = plot_trial_temperature_profiles()
+trial_temp_fig = plot_trial_energy_profiles()
 trial_temp_fig.show()
 
 print(f"\nFinal avg temp: {avg_temp[-1]:.2f} K (ΔT = {avg_temp[-1]-293:.4f} K)")
 print(f"Final exit energy: {exit_energy[-1]:.2f} MeV (of {PROTON_KE_MEV:.0f} MeV input)")
+default_column_mass_kg = np.sum(cell_masses)
+default_mass_normalized_delta_T = compute_mass_normalized_temperature_rise(
+    T_final, cell_masses, default_column_mass_kg
+)
+default_mass_normalized_energy = total_deposited_energy_J / default_column_mass_kg
+print(f"Mass-normalized final temperature rise: {default_mass_normalized_delta_T:.4e} K/kg")
+print(f"Mass-normalized deposited energy: {default_mass_normalized_energy:.4e} J/kg")
