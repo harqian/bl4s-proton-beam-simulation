@@ -420,10 +420,28 @@ def plot_trial_energy_profiles():
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig("temperature_rise_by_trial.png", dpi=150)
+    fig.savefig("energy_rise_by_trial.png", dpi=150)
     return fig
 
 
+def plot_trial_temperature_profiles():
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for label, bismuth_g, water_ml in TRIALS:
+        material_map = build_trial_material_map(bismuth_g, water_ml)
+        total_mass_kg = compute_trial_total_mass_kg(bismuth_g, water_ml)
+        _, _, _, _, z, T_final, _, _ = simulate_material_map(material_map)
+        ax.plot(z * 1000, (T_final - T_ENV), linewidth=2, label=label)
+
+    ax.set_xlabel("Depth Through Shield (mm)")
+    ax.set_ylabel("Rise in Temperature (K), log scale)")
+    ax.set_title("Rise in Temterature (K) vs Depth (mm) for Shield Trials")
+    ax.set_yscale("log")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig("temperature_rise_by_trial.png", dpi=150)
+    return fig
 # ===================== RUN =====================
 
 times, avg_temp, exit_energy, layer_temps, z, T_final, total_deposited_energy_J, cell_masses = run_simulation()
@@ -459,13 +477,12 @@ for i in range(1, NUM_PHYSICAL_LAYERS):
 
 plt.tight_layout()
 plt.savefig("simulation_results.png", dpi=150)
-plt.show()
 
 trial_fig = plot_trial_energy_remaining_profiles()
-trial_fig.show()
 
-trial_temp_fig = plot_trial_energy_profiles()
-trial_temp_fig.show()
+trial_energy_fig = plot_trial_energy_profiles()
+
+trial_temp_fig = plot_trial_temperature_profiles()
 
 print(f"\nFinal avg temp: {avg_temp[-1]:.2f} K (ΔT = {avg_temp[-1]-293:.4f} K)")
 print(f"Final exit energy: {exit_energy[-1]:.2f} MeV (of {PROTON_KE_MEV:.0f} MeV input)")
